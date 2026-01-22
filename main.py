@@ -4,12 +4,12 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher
 
-# ІМПОРТИ РОУТЕРІВ (перевір назви змінних в кінці файлів handlers)
 from handlers.admin_handlers import admin_router
 from handlers.client_handlers import client_router
 
 
 async def start_web_server():
+    """Потрібно для Render Free Web Service (щоб був відкритий PORT)."""
     app = web.Application()
 
     async def health(request):
@@ -33,7 +33,7 @@ async def start_bot():
     bot = Bot(token=token)
     dp = Dispatcher()
 
-    # Підключаємо маршрути
+    # Порядок важливий: спочатку клієнт, потім адмін (або навпаки — але так логічніше)
     dp.include_router(client_router)
     dp.include_router(admin_router)
 
