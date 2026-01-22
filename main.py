@@ -43,6 +43,20 @@ async def main():
         start_web_server(),
         start_bot(),
     )
+async def start_web_server():
+    app = web.Application()
+
+    async def health(request):
+        return web.Response(text="ok")
+
+    app.router.add_get("/", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
 
 if __name__ == "__main__":
