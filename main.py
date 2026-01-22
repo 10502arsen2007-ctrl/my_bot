@@ -1,55 +1,48 @@
+import os
 import asyncio
-import logging
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.types import Update
-
-from config import settings
-from database import init_db
-from handlers.client_handlers import client_router
-from handlers.admin_handlers import admin_router
+from aiogram.filters import Command
+from aiogram.types import Message
 
 
-async def on_unhandled_update(update: Update) -> None:
-    """
-    Корисно під час дебагу, коли бачиш:
-    'Update is not handled'
-    Тут можна швидко подивитись тип/дані апдейту в логах.
-    """
-    try:
-        logging.getLogger("unhandled").warning("Unhandled update: %s", update.model_dump())
-    except Exception:
-        logging.getLogger("unhandled").warning("Unhandled update (failed to dump)")
+async def start_web_server():
+    app = web.Application()
+
+    async def health(request):
+        return web.Response(text="ok")
+
+    app.router.add_get("/", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+
+async def start_bot():
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError("BOT_TOKEN is not set")
+
+    bot = Bot(token=token)
+    dp = Dispatcher()
+
+    @dp.message(Command("start"))
+    async def cmd_start(message: Message):
+        await message.answer("Бот працює на Render (Free).")
+
+    await dp.start_polling(bot)
 
 
 async def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    await asyncio.gather(
+        start_web_server(),
+        start_bot(),
     )
-
-    # Важливо: спочатку БД, потім старт бота
-    await init_db()
-
-    bot = Bot(
-        token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
-    dp = Dispatcher()
-
-    # Підключення роутерів
-    dp.include_router(client_router)
-    dp.include_router(admin_router)
-
-    # Ловимо невловлені апдейти (для дебага)
-    dp.errors.register(lambda e: logging.getLogger("dp.error").exception("Dispatcher error", exc_info=e.exception))
-    dp.update.register(on_unhandled_update)
-
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
