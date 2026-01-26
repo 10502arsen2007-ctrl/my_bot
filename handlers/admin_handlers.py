@@ -1,6 +1,7 @@
 # handlers/admin_handlers.py
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta
 from typing import Optional, List
 
@@ -9,15 +10,12 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
 
 from config import settings
-
-# IMPORTANT:
-# - Цей файл оновлено під нову логіку слотів (годинна сітка + 1 додатковий слот для коротких послуг).
-# - Під "settings" очікується наявність get_shop_settings() і (бажано) set_shop_setting(key, value)
-#   або окремих setter-ів. Нижче є безпечний helper, який працює в обох варіантах.
-
 import database as db
+
+log = logging.getLogger(__name__)
 
 admin_router = Router()
 
@@ -46,7 +44,19 @@ async def _try_delete_message(msg: Message) -> None:
     try:
         await msg.delete()
     except Exception:
-        pass
+        return
+
+
+async def _clear_flow_keep_ui(state: FSMContext) -> None:
+    """
+    Очищає FSM, але зберігає admin_ui_msg_id,
+    щоб адмін-панель НЕ створювала новий "екран".
+    """
+    data = await state.get_data()
+    ui_msg_id = data.get("admin_ui_msg_id")
+    await state.clear()
+    if isinstance(ui_msg_id, int) and ui_msg_id > 0:
+        await state.update_data(admin_ui_msg_id=ui_msg_id)
 
 
 async def _ui_get_or_create_screen(message: Message, state: FSMContext) -> int:
@@ -82,8 +92,11 @@ async def _ui_render(
                 parse_mode=parse_mode,
             )
             return
-        except Exception:
-            pass
+        except TelegramBadRequest as e:
+            # message to edit not found / message is not modified / etc.
+            log.warning("ADMIN UI edit failed: %s", e)
+        except Exception as e:
+            log.exception("ADMIN UI edit unexpected error: %s", e)
 
     sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
     await state.update_data(admin_ui_msg_id=sent.message_id)
@@ -121,28 +134,75 @@ def _overlap(a_s: int, a_e: int, b_s: int, b_e: int) -> bool:
 async def _set_shop_setting(key: str, value: int) -> None:
     """
     Підтримує 2 варіанти database.py:
-    1) є універсальна функція db.set_shop_setting(key, value)
-    2) є окремі setter-и (set_min_lead_minutes, etc.)
+    1) db.set_shop_setting(key, value)
+    2) набір специфічних setter-ів
     """
     if hasattr(db, "set_shop_setting"):
         await db.set_shop_setting(key, int(value))
         return
 
-    # Fallback: пробуємо знайти специфічний setter
     mapping = {
         "base_grid_minutes": "set_base_grid_minutes",
         "short_service_threshold_minutes": "set_short_service_threshold_minutes",
         "rest_minutes_after_short": "set_rest_minutes_after_short",
         "extra_round_minutes": "set_extra_round_minutes",
         "min_lead_minutes": "set_min_lead_minutes",
-        # legacy compatibility (якщо у тебе ще лишилось старе поле)
-        "slot_step_minutes": "set_slot_step_minutes",
+        "slot_step_minutes": "set_slot_step_minutes",  # legacy
     }
     fn_name = mapping.get(key)
     if not fn_name or not hasattr(db, fn_name):
         raise RuntimeError(f"No setter for shop setting: {key}")
 
     await getattr(db, fn_name)(int(value))
+
+
+async def _get_global_breaks() -> List[dict]:
+    """
+    Безпечний доступ до "глобальних" перерв.
+    Під різні database.py: пробуємо кілька варіантів.
+    """
+    # 1) якщо є спеціальна функція
+    if hasattr(db, "get_global_breaks"):
+        return await db.get_global_breaks()
+
+    # 2) якщо get_breaks_for_weekday приймає weekday=None
+    if hasattr(db, "get_breaks_for_weekday"):
+        try:
+            rows = await db.get_breaks_for_weekday(None)
+            return rows or []
+        except TypeError:
+            pass
+        except Exception as e:
+            log.warning("get_breaks_for_weekday(None) failed: %s", e)
+
+    # 3) fallback: беремо weekday=0 і відфільтровуємо weekday is None
+    try:
+        rows = await db.get_breaks_for_weekday(weekday=0)
+        rows = rows or []
+        return [b for b in rows if b.get("weekday") is None]
+    except Exception as e:
+        log.exception("Fallback breaks load failed: %s", e)
+        return []
+
+
+async def _add_break_global(start_time: str, end_time: str) -> None:
+    if hasattr(db, "add_break"):
+        await db.add_break(None, start_time, end_time)
+        return
+    if hasattr(db, "add_break_global"):
+        await db.add_break_global(start_time, end_time)
+        return
+    raise RuntimeError("No function to add global break in database.py")
+
+
+async def _remove_break(break_id: int) -> None:
+    if hasattr(db, "remove_break"):
+        await db.remove_break(break_id)
+        return
+    if hasattr(db, "delete_break"):
+        await db.delete_break(break_id)
+        return
+    raise RuntimeError("No function to remove break in database.py")
 
 
 def _kb_admin_main() -> InlineKeyboardMarkup:
@@ -236,8 +296,7 @@ def _kb_day_edit(wd: int, is_working: bool, ws: str, we: str) -> InlineKeyboardM
 
 def _kb_time_pick(wd: int, field: str, current: str) -> InlineKeyboardMarkup:
     times: List[str] = []
-    start_h, end_h = 7, 22
-    for h in range(start_h, end_h + 1):
+    for h in range(7, 23):
         for m in (0, 30):
             times.append(f"{h:02d}:{m:02d}")
 
@@ -336,8 +395,11 @@ async def ad_menu(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
 
-    await state.clear()
+    await _clear_flow_keep_ui(state)
     await _ui_render(
         bot=callback.bot,
         chat_id=callback.message.chat.id,
@@ -360,6 +422,9 @@ async def ad_menu(callback: CallbackQuery, state: FSMContext):
 async def ad_today(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
         return
 
     d = date.today().isoformat()
@@ -403,6 +468,9 @@ async def ad_pending(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
 
     pending = await db.get_pending_bookings_admin()
     if not pending:
@@ -434,6 +502,9 @@ async def ad_pending(callback: CallbackQuery, state: FSMContext):
 async def ad_reports(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
         return
 
     await _ui_render(
@@ -482,6 +553,9 @@ async def ad_report_today(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
     d = date.today().isoformat()
     await _render_report(callback.bot, callback.message.chat.id, state, d, d, "Звіт за сьогодні")
     await callback.answer()
@@ -492,6 +566,9 @@ async def ad_report_week(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
     start, end = _period_dates(7)
     await _render_report(callback.bot, callback.message.chat.id, state, start, end, "Звіт за останні 7 днів")
     await callback.answer()
@@ -501,6 +578,9 @@ async def ad_report_week(callback: CallbackQuery, state: FSMContext):
 async def ad_report_month(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
         return
     start, end = _period_dates(30)
     await _render_report(callback.bot, callback.message.chat.id, state, start, end, "Звіт за останні 30 днів")
@@ -515,6 +595,9 @@ async def ad_report_month(callback: CallbackQuery, state: FSMContext):
 async def ad_settings(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
         return
 
     s = await db.get_shop_settings()
@@ -533,6 +616,10 @@ async def ad_settings_grid_menu(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
+
     s = await db.get_shop_settings()
     cur = int(s.get("base_grid_minutes", 60))
     await _ui_render(
@@ -550,12 +637,15 @@ async def ad_settings_grid_set(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+
     minutes = int(callback.data.split(":")[2])
     try:
         await _set_shop_setting("base_grid_minutes", minutes)
-    except Exception:
+    except Exception as e:
+        log.exception("Failed to set base_grid_minutes: %s", e)
         await callback.answer("Не вдалося змінити сітку.", show_alert=True)
         return
+
     await callback.answer("Збережено ✅", show_alert=True)
     await ad_settings(callback, state)
 
@@ -565,6 +655,10 @@ async def ad_settings_short_thr_menu(callback: CallbackQuery, state: FSMContext)
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
+
     s = await db.get_shop_settings()
     cur = int(s.get("short_service_threshold_minutes", 40))
     await _ui_render(
@@ -582,12 +676,15 @@ async def ad_settings_short_thr_set(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+
     minutes = int(callback.data.split(":")[2])
     try:
         await _set_shop_setting("short_service_threshold_minutes", minutes)
-    except Exception:
+    except Exception as e:
+        log.exception("Failed to set short_service_threshold_minutes: %s", e)
         await callback.answer("Не вдалося змінити поріг.", show_alert=True)
         return
+
     await callback.answer("Збережено ✅", show_alert=True)
     await ad_settings(callback, state)
 
@@ -597,6 +694,10 @@ async def ad_settings_rest_short_menu(callback: CallbackQuery, state: FSMContext
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
+
     s = await db.get_shop_settings()
     cur = int(s.get("rest_minutes_after_short", 5))
     await _ui_render(
@@ -614,12 +715,15 @@ async def ad_settings_rest_short_set(callback: CallbackQuery, state: FSMContext)
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+
     minutes = int(callback.data.split(":")[2])
     try:
         await _set_shop_setting("rest_minutes_after_short", minutes)
-    except Exception:
+    except Exception as e:
+        log.exception("Failed to set rest_minutes_after_short: %s", e)
         await callback.answer("Не вдалося змінити паузу.", show_alert=True)
         return
+
     await callback.answer("Збережено ✅", show_alert=True)
     await ad_settings(callback, state)
 
@@ -629,6 +733,10 @@ async def ad_settings_extra_round_menu(callback: CallbackQuery, state: FSMContex
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
+
     s = await db.get_shop_settings()
     cur = int(s.get("extra_round_minutes", 15))
     await _ui_render(
@@ -646,12 +754,15 @@ async def ad_settings_extra_round_set(callback: CallbackQuery, state: FSMContext
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+
     minutes = int(callback.data.split(":")[2])
     try:
         await _set_shop_setting("extra_round_minutes", minutes)
-    except Exception:
+    except Exception as e:
+        log.exception("Failed to set extra_round_minutes: %s", e)
         await callback.answer("Не вдалося змінити округлення.", show_alert=True)
         return
+
     await callback.answer("Збережено ✅", show_alert=True)
     await ad_settings(callback, state)
 
@@ -661,6 +772,10 @@ async def ad_settings_lead_menu(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
+
     s = await db.get_shop_settings()
     cur = int(s.get("min_lead_minutes", 0))
     await _ui_render(
@@ -678,12 +793,15 @@ async def ad_settings_lead_set(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+
     minutes = int(callback.data.split(":")[2])
     try:
         await _set_shop_setting("min_lead_minutes", minutes)
-    except Exception:
+    except Exception as e:
+        log.exception("Failed to set min_lead_minutes: %s", e)
         await callback.answer("Не вдалося змінити запас.", show_alert=True)
         return
+
     await callback.answer("Збережено ✅", show_alert=True)
     await ad_settings(callback, state)
 
@@ -692,6 +810,9 @@ async def ad_settings_lead_set(callback: CallbackQuery, state: FSMContext):
 async def ad_schedule(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
         return
 
     schedule = await db.get_weekly_schedule()
@@ -709,6 +830,9 @@ async def ad_schedule(callback: CallbackQuery, state: FSMContext):
 async def ad_schedule_day(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
         return
 
     wd = int(callback.data.split(":")[3])
@@ -732,6 +856,9 @@ async def ad_schedule_toggle(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
 
     wd = int(callback.data.split(":")[3])
     info = await db.get_day_schedule(wd)
@@ -749,6 +876,10 @@ async def ad_schedule_pick_ws(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
+
     wd = int(callback.data.split(":")[4])
     info = await db.get_day_schedule(wd)
     if not info:
@@ -770,6 +901,10 @@ async def ad_schedule_pick_we(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
+
     wd = int(callback.data.split(":")[4])
     info = await db.get_day_schedule(wd)
     if not info:
@@ -791,9 +926,11 @@ async def ad_schedule_apply_time(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
 
-    # ad:sch:pick:{wd}:{field}:{hhmm}
-    parts = callback.data.split(":")
+    parts = callback.data.split(":")  # ad:sch:pick:{wd}:{field}:{hhmm}
     wd = int(parts[3])
     field = parts[4]  # ws / we
     hhmm = parts[5]
@@ -827,10 +964,11 @@ async def ad_breaks(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
         return
+    if not callback.message:
+        await callback.answer()
+        return
 
-    # беремо "глобальні" перерви (weekday is NULL)
-    rows = await db.get_breaks_for_weekday(weekday=0)
-    global_breaks = [b for b in rows if b.get("weekday") is None]
+    global_breaks = await _get_global_breaks()
 
     text_lines = ["<b>☕ Перерви (для всіх днів)</b>\n"]
     if not global_breaks:
@@ -860,8 +998,9 @@ async def ad_breaks_add(callback: CallbackQuery, state: FSMContext):
     st = f"{parts[3][:2]}:{parts[3][2:]}"
     et = f"{parts[4][:2]}:{parts[4][2:]}"
     try:
-        await db.add_break(None, st, et)
-    except Exception:
+        await _add_break_global(st, et)
+    except Exception as e:
+        log.exception("Failed to add break: %s", e)
         await callback.answer("Не вдалося додати перерву.", show_alert=True)
         return
 
@@ -877,8 +1016,9 @@ async def ad_breaks_del(callback: CallbackQuery, state: FSMContext):
 
     bid = int(callback.data.split(":")[3])
     try:
-        await db.remove_break(bid)
-    except Exception:
+        await _remove_break(bid)
+    except Exception as e:
+        log.exception("Failed to remove break: %s", e)
         await callback.answer("Не вдалося видалити.", show_alert=True)
         return
 
@@ -890,6 +1030,9 @@ async def ad_breaks_del(callback: CallbackQuery, state: FSMContext):
 async def ad_dayoff_list(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
         return
 
     await _ui_render(
@@ -906,6 +1049,9 @@ async def ad_dayoff_list(callback: CallbackQuery, state: FSMContext):
 async def ad_dayoff_pick(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Недостатньо прав.", show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
         return
 
     date_str = callback.data.split(":")[3]
@@ -1019,77 +1165,11 @@ async def _send_bookings_for_date(message: Message, date_str: str):
     await message.answer(f"Записи на {date_str}:\n\n" + "\n".join(lines))
 
 
-@admin_router.message(Command("off"))
-async def set_day_off_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    parts = message.text.strip().split()
-    if len(parts) == 1:
-        target = date.today()
-    elif len(parts) == 2:
-        try:
-            target = datetime.strptime(parts[1], "%Y-%m-%d").date()
-        except ValueError:
-            await message.answer("Невірний формат дати. Приклад: /off 2026-01-15")
-            return
-    else:
-        await message.answer("Формат: /off або /off YYYY-MM-DD")
-        return
-
-    await db.add_day_off(target.isoformat())
-    await message.answer(f"День <b>{target.isoformat()}</b> позначено як <b>вихідний</b>.", parse_mode="HTML")
-
-
-@admin_router.message(Command("on"))
-async def set_day_on_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    parts = message.text.strip().split()
-    if len(parts) == 1:
-        target = date.today()
-    elif len(parts) == 2:
-        try:
-            target = datetime.strptime(parts[1], "%Y-%m-%d").date()
-        except ValueError:
-            await message.answer("Невірний формат дати. Приклад: /on 2026-01-15")
-            return
-    else:
-        await message.answer("Формат: /on або /on YYYY-MM-DD")
-        return
-
-    await db.remove_day_off(target.isoformat())
-    await message.answer(f"День <b>{target.isoformat()}</b> знову вважається <b>робочим</b>.", parse_mode="HTML")
-
-
-@admin_router.message(Command("pending"))
-async def pending_bookings_cmd(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    pending = await db.get_pending_bookings_admin()
-    if not pending:
-        await message.answer("Немає заявок у статусі pending.")
-        return
-
-    lines = []
-    for bid, date_str, time_str, service_text, client_name in pending:
-        lines.append(f"#{bid} {date_str} {time_str} — {service_text} ({client_name})")
-
-    await message.answer("<b>Pending-заявки:</b>\n\n" + "\n".join(lines), parse_mode="HTML")
-
-
 # =======================
 #  Approve / Reject (callbacks)
 # =======================
 
 async def _booking_occupy_minutes(duration_minutes: int, shop: dict) -> int:
-    """
-    Для конфліктів використовуємо occupy_minutes:
-    - для коротких (< threshold): duration + rest_after_short, округлити до extra_round
-    - інакше duration
-    """
     short_thr = int(shop.get("short_service_threshold_minutes", 40))
     rest_short = int(shop.get("rest_minutes_after_short", 5))
     extra_round = int(shop.get("extra_round_minutes", 15))
@@ -1125,32 +1205,31 @@ async def approve_booking(callback: CallbackQuery):
         await callback.answer("Запис уже неактивний.", show_alert=True)
         return
 
-    # Перевірка конфлікту за інтервалами (з урахуванням occupy_minutes)
     shop = await db.get_shop_settings()
     cand_s = _time_to_minutes(time_str)
     cand_e = cand_s + await _booking_occupy_minutes(duration_minutes, shop)
 
-    # беремо всі активні на дату (pending+approved), крім цього booking_id
     active = await db.get_active_bookings_for_date(date.fromisoformat(date_str))
     for b in active:
         if int(b.get("id")) == booking_id:
             continue
         bs = _time_to_minutes(b["time"])
-        # якщо у таблиці є occupy_minutes — використовуємо його, інакше рахуємо з duration_minutes
         occ = b.get("occupy_minutes")
         if occ is None:
             occ = await _booking_occupy_minutes(int(b["duration_minutes"]), shop)
         be = bs + int(occ)
         if _overlap(cand_s, cand_e, bs, be):
-            # конфлікт => відхиляємо
             await db.update_booking_status(booking_id, "rejected")
             await callback.answer("Конфлікт по часу. Запит відхилено.", show_alert=True)
+
+            if callback.message:
+                try:
+                    await callback.message.edit_text(callback.message.text + "\n\n❌ Автоматично відхилено (конфлікт).")
+                except Exception:
+                    pass
+
             try:
-                await callback.message.edit_text(callback.message.text + "\n\n❌ Автоматично відхилено (конфлікт).")
-            except Exception:
-                pass
-            try:
-                await callback.message.bot.send_message(
+                await callback.bot.send_message(
                     chat_id=client_tg_id,
                     text="На жаль, цей час уже зайнятий. Оберіть, будь ласка, інший час або день."
                 )
@@ -1161,14 +1240,15 @@ async def approve_booking(callback: CallbackQuery):
     await db.update_booking_status(booking_id, "approved")
     await callback.answer("Запис підтверджено ✅", show_alert=True)
 
-    try:
-        await callback.message.edit_text(callback.message.text + "\n\n✅ Підтверджено.")
-    except Exception:
-        pass
+    if callback.message:
+        try:
+            await callback.message.edit_text(callback.message.text + "\n\n✅ Підтверджено.")
+        except Exception:
+            pass
 
     try:
         end_time = _minutes_to_time(_time_to_minutes(time_str) + int(duration_minutes))
-        await callback.message.bot.send_message(
+        await callback.bot.send_message(
             chat_id=client_tg_id,
             text=(
                 f"Ваш запис підтверджено ✅\n\n"
@@ -1207,13 +1287,14 @@ async def reject_booking(callback: CallbackQuery):
     await db.update_booking_status(booking_id, "rejected")
     await callback.answer("Запит відхилено ❌", show_alert=True)
 
-    try:
-        await callback.message.edit_text(callback.message.text + "\n\n❌ Відхилено.")
-    except Exception:
-        pass
+    if callback.message:
+        try:
+            await callback.message.edit_text(callback.message.text + "\n\n❌ Відхилено.")
+        except Exception:
+            pass
 
     try:
-        await callback.message.bot.send_message(
+        await callback.bot.send_message(
             chat_id=client_tg_id,
             text="На жаль, ваш запит на запис було відхилено ❌\n\nСпробуйте інший час або день."
         )
@@ -1334,4 +1415,4 @@ async def broadcast_cmd(message: Message):
 )
 async def _debug_unhandled_admin_callbacks(callback: CallbackQuery):
     await callback.answer("Невідомий ADMIN callback. Дивись лог.", show_alert=True)
-    print("DEBUG ADMIN CALLBACK DATA:", callback.data)
+    log.warning("UNHANDLED ADMIN CALLBACK: %s", callback.data)
