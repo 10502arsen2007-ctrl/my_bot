@@ -1,19 +1,30 @@
 import os
 import asyncio
+import logging
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher
+
+from config import settings
 from handlers.admin_handlers import admin_router
 from handlers.client_handlers import client_router
 
 
-async def start_web_server():
+log = logging.getLogger(__name__)
+
+
+async def start_web_server() -> web.AppRunner:
+    """HTTP сервер потрібен Render Web Service (Free), щоб був відкритий PORT."""
     app = web.Application()
 
-    async def health(request):
+    async def root(_request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
-    app.router.add_get("/", health)
+    async def healthz(_request: web.Request) -> web.Response:
+        return web.Response(text="healthy")
+
+    app.router.add_get("/", root)
+    app.router.add_get("/healthz", healthz)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -22,36 +33,43 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    print(f"WEB: server started on port {port}")
+    log.info("WEB server started on port %s", port)
+    return runner
 
 
-async def start_bot():
-    print("BOT: starting...")
-
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        raise RuntimeError("BOT_TOKEN is not set")
-
-    print("BOT_TOKEN present:", True)
-
-    bot = Bot(token=token)
+async def start_bot() -> None:
+    bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
 
     dp.include_router(client_router)
     dp.include_router(admin_router)
 
-    print("BOT: routers included")
-    print("BOT: polling started")
-
+    log.info("BOT polling started")
     await dp.start_polling(bot)
 
 
-async def main():
-    await asyncio.gather(
-        start_web_server(),
-        start_bot(),
+async def main() -> None:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+
+    runner = await start_web_server()
+
+    bot_task = asyncio.create_task(start_bot(), name="bot_polling")
+
+    try:
+        await bot_task
+    except asyncio.CancelledError:
+        # нормальний шлях при зупинці
+        pass
+    finally:
+        log.info("Shutting down WEB server...")
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

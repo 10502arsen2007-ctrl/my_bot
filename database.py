@@ -76,18 +76,22 @@ async def init_db() -> None:
                 date TEXT NOT NULL,                 -- 'YYYY-MM-DD'
                 time TEXT NOT NULL,                 -- 'HH:MM'
                 duration_minutes INTEGER NOT NULL,  -- тривалість послуги
+                occupy_minutes INTEGER,             -- фактична зайнятість (duration + пауза/округлення), може бути NULL
                 service_code TEXT,                  -- 'short','beard', ...
                 service_text TEXT NOT NULL,         -- назва послуги
                 price_text TEXT NOT NULL,           -- '350 грн', '350–400 грн'
                 client_name TEXT NOT NULL,
                 phone TEXT NOT NULL,
-                status TEXT NOT NULL,               -- 'pending','approved','completed','rejected','cancelled_by_client','cancelled_by_admin'
+                status TEXT NOT NULL,               -- pending/approved/completed/rejected/cancelled_*
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (client_id) REFERENCES users(id)
             )
             """
         )
+
+        # migrations for bookings (older DBs may not have occupy_minutes)
+        await _ensure_column(db, "bookings", "occupy_minutes", "occupy_minutes INTEGER")
 
         # indices
         await db.execute("CREATE INDEX IF NOT EXISTS idx_bookings_date ON bookings(date)")
@@ -106,11 +110,6 @@ async def init_db() -> None:
         )
 
         # shop_settings (1 row table id=1)
-        # НОВА логіка:
-        # - base_grid_minutes: 60 (10:00, 11:00...)
-        # - для duration < short_service_threshold_minutes дозволяємо 1 додатковий слот у годині
-        # - rest_minutes_after_short додається для розрахунку другого слоту/зайнятості
-        # - extra_round_minutes: округлення другого слоту (наприклад 15 хв)
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS shop_settings (
@@ -149,14 +148,30 @@ async def init_db() -> None:
             "extra_round_minutes",
             "extra_round_minutes INTEGER NOT NULL DEFAULT 15",
         )
-        # keep old columns if they existed (slot_step_minutes), but we no longer rely on them.
+        await _ensure_column(
+            db,
+            "shop_settings",
+            "min_lead_minutes",
+            "min_lead_minutes INTEGER NOT NULL DEFAULT 0",
+        )
+        await _ensure_column(
+            db,
+            "shop_settings",
+            "default_work_start",
+            "default_work_start TEXT NOT NULL DEFAULT '09:00'",
+        )
+        await _ensure_column(
+            db,
+            "shop_settings",
+            "default_work_end",
+            "default_work_end TEXT NOT NULL DEFAULT '19:00'",
+        )
 
         # schedule by weekday
-        # weekday: 0=Mon ... 6=Sun
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS weekly_schedule (
-                weekday INTEGER PRIMARY KEY,
+                weekday INTEGER PRIMARY KEY,         -- 0=Mon ... 6=Sun
                 is_working INTEGER NOT NULL DEFAULT 1,
                 work_start TEXT NOT NULL DEFAULT '09:00',
                 work_end   TEXT NOT NULL DEFAULT '19:00'
@@ -203,8 +218,8 @@ async def init_db() -> None:
                 booking_id INTEGER,
                 target TEXT NOT NULL,        -- 'client' | 'master'
                 tg_id INTEGER NOT NULL,
-                remind_at TEXT NOT NULL,     -- ISO datetime (UTC) recommended
-                type TEXT NOT NULL,          -- '2h' | '30m' | '10m' | 'daily_digest' | ...
+                remind_at TEXT NOT NULL,     -- ISO datetime (UTC recommended)
+                type TEXT NOT NULL,          -- '2h' | '30m' | ...
                 status TEXT NOT NULL DEFAULT 'pending',  -- 'pending' | 'sent' | 'canceled' | 'failed'
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT,
@@ -289,7 +304,6 @@ async def get_user(tg_id: int) -> Optional[Dict[str, Any]]:
 
 async def get_shop_settings() -> Dict[str, Any]:
     async with aiosqlite.connect(DB_PATH) as db:
-        # Try to read new schema first
         cur = await db.execute(
             """
             SELECT
@@ -319,8 +333,8 @@ async def get_shop_settings() -> Dict[str, Any]:
 
 async def set_base_grid_minutes(minutes: int) -> None:
     minutes = int(minutes)
-    if minutes not in (30, 60):
-        raise ValueError("base_grid_minutes must be 30 or 60")
+    if minutes not in (30, 60, 90, 120):
+        raise ValueError("base_grid_minutes must be one of: 30, 60, 90, 120")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE shop_settings SET base_grid_minutes = ? WHERE id = 1", (minutes,))
         await db.commit()
@@ -364,11 +378,30 @@ async def set_min_lead_minutes(minutes: int) -> None:
     if minutes < 0 or minutes > 24 * 60:
         raise ValueError("min_lead_minutes must be between 0 and 1440")
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE shop_settings SET min_lead_minutes = ? WHERE id = 1",
-            (minutes,),
-        )
+        await db.execute("UPDATE shop_settings SET min_lead_minutes = ? WHERE id = 1", (minutes,))
         await db.commit()
+
+
+async def set_shop_setting(key: str, value: int) -> None:
+    """
+    Універсальний setter для адмінки (admin_handlers.py).
+    """
+    key = str(key).strip()
+    value = int(value)
+
+    mapping = {
+        "base_grid_minutes": set_base_grid_minutes,
+        "short_service_threshold_minutes": set_short_service_threshold_minutes,
+        "rest_minutes_after_short": set_rest_minutes_after_short,
+        "extra_round_minutes": set_extra_round_minutes,
+        "min_lead_minutes": set_min_lead_minutes,
+        # legacy
+        "slot_step_minutes": set_slot_step_minutes,
+    }
+    fn = mapping.get(key)
+    if not fn:
+        raise ValueError(f"Unknown shop setting key: {key}")
+    await fn(value)
 
 
 async def get_weekly_schedule() -> Dict[int, Dict[str, Any]]:
@@ -387,11 +420,7 @@ async def get_weekly_schedule() -> Dict[int, Dict[str, Any]]:
 
     out: Dict[int, Dict[str, Any]] = {}
     for wd, is_working, ws, we in rows:
-        out[int(wd)] = {
-            "is_working": bool(is_working),
-            "work_start": ws,
-            "work_end": we,
-        }
+        out[int(wd)] = {"is_working": bool(is_working), "work_start": ws, "work_end": we}
     return out
 
 
@@ -410,12 +439,7 @@ async def get_day_schedule(weekday: int) -> Optional[Dict[str, Any]]:
     if not row:
         return None
 
-    return {
-        "weekday": int(row[0]),
-        "is_working": bool(row[1]),
-        "work_start": row[2],
-        "work_end": row[3],
-    }
+    return {"weekday": int(row[0]), "is_working": bool(row[1]), "work_start": row[2], "work_end": row[3]}
 
 
 async def set_day_schedule(
@@ -501,10 +525,7 @@ async def add_break(weekday: Optional[int], start_time: str, end_time: str) -> i
 
 async def remove_break(break_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM schedule_breaks WHERE id = ?",
-            (int(break_id),),
-        )
+        await db.execute("DELETE FROM schedule_breaks WHERE id = ?", (int(break_id),))
         await db.commit()
 
 
@@ -576,6 +597,7 @@ async def create_booking(
     client_name: str,
     phone: str,
     status: str = "pending",
+    occupy_minutes: Optional[int] = None,
 ) -> int:
     """
     НЕ атомарно. Залишено для сумісності.
@@ -586,15 +608,16 @@ async def create_booking(
         cursor = await db.execute(
             """
             INSERT INTO bookings
-            (client_id, date, time, duration_minutes, service_code, service_text, price_text,
+            (client_id, date, time, duration_minutes, occupy_minutes, service_code, service_text, price_text,
              client_name, phone, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 client_id,
                 date_str,
                 time_str,
                 int(duration_minutes),
+                (int(occupy_minutes) if occupy_minutes is not None else None),
                 service_code,
                 service_text,
                 price_text,
@@ -626,7 +649,7 @@ async def create_booking_atomic(
     """
     Атомарне створення броні в SQLite:
     - BEGIN IMMEDIATE
-    - перевірка перетинів по активних бронях
+    - перевірка перетинів по активних бронях (pending/approved), з урахуванням occupy_minutes існуючих записів
     - вставка
 
     occupy_minutes:
@@ -635,8 +658,8 @@ async def create_booking_atomic(
     """
     now = _iso_utc_now()
     new_start = _to_minutes(time_str)
-    occ = int(occupy_minutes) if occupy_minutes is not None else int(duration_minutes)
-    new_end = new_start + occ
+    occ_new = int(occupy_minutes) if occupy_minutes is not None else int(duration_minutes)
+    new_end = new_start + occ_new
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON")
@@ -644,7 +667,7 @@ async def create_booking_atomic(
 
         cur = await db.execute(
             """
-            SELECT time, duration_minutes
+            SELECT time, duration_minutes, occupy_minutes
             FROM bookings
             WHERE date = ?
               AND status IN ('pending','approved')
@@ -653,12 +676,10 @@ async def create_booking_atomic(
         )
         rows = await cur.fetchall()
 
-        # NOTE: тут для існуючих броней беремо duration_minutes як "зайнятість".
-        # Якщо ти хочеш враховувати буфер у всіх послуг — тоді треба зберігати occupy_minutes в bookings
-        # або обчислювати за service_code/налаштуваннями в генераторі слотів.
-        for t, dur in rows:
+        for t, dur, occ_db in rows:
             s = _to_minutes(t)
-            e = s + int(dur)
+            occ_existing = int(occ_db) if occ_db is not None else int(dur)
+            e = s + occ_existing
             if _intervals_overlap(new_start, new_end, s, e):
                 await db.execute("ROLLBACK")
                 raise ValueError("TIME_SLOT_ALREADY_TAKEN")
@@ -666,15 +687,16 @@ async def create_booking_atomic(
         cursor = await db.execute(
             """
             INSERT INTO bookings
-            (client_id, date, time, duration_minutes, service_code, service_text, price_text,
+            (client_id, date, time, duration_minutes, occupy_minutes, service_code, service_text, price_text,
              client_name, phone, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 client_id,
                 date_str,
                 time_str,
                 int(duration_minutes),
+                (int(occupy_minutes) if occupy_minutes is not None else None),
                 service_code,
                 service_text,
                 price_text,
@@ -692,12 +714,12 @@ async def create_booking_atomic(
 async def get_active_bookings_for_date(target_date: date) -> List[Dict[str, Any]]:
     """
     Активні записи (pending/approved) на дату.
-    Використовується для перевірки перетинів.
+    Використовується для генерації слотів / перевірки перетинів.
     """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            SELECT id, time, duration_minutes, status
+            SELECT id, time, duration_minutes, occupy_minutes, status
             FROM bookings
             WHERE date = ?
               AND status IN ('pending', 'approved')
@@ -711,7 +733,8 @@ async def get_active_bookings_for_date(target_date: date) -> List[Dict[str, Any]
             "id": int(r[0]),
             "time": r[1],
             "duration_minutes": int(r[2]),
-            "status": r[3],
+            "occupy_minutes": (int(r[3]) if r[3] is not None else None),
+            "status": r[4],
         }
         for r in rows
     ]
@@ -742,7 +765,7 @@ async def get_bookings_for_date(target_date: date) -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            SELECT id, date, time, duration_minutes, client_name, phone, service_text, price_text, status
+            SELECT id, date, time, duration_minutes, occupy_minutes, client_name, phone, service_text, price_text, status
             FROM bookings
             WHERE date = ?
             ORDER BY time
@@ -757,11 +780,12 @@ async def get_bookings_for_date(target_date: date) -> List[Dict[str, Any]]:
             "date": r[1],
             "time": r[2],
             "duration_minutes": int(r[3]),
-            "client_name": r[4],
-            "phone": r[5],
-            "service_text": r[6],
-            "price_text": r[7],
-            "status": r[8],
+            "occupy_minutes": (int(r[4]) if r[4] is not None else None),
+            "client_name": r[5],
+            "phone": r[6],
+            "service_text": r[7],
+            "price_text": r[8],
+            "status": r[9],
         }
         for r in rows
     ]
@@ -771,7 +795,7 @@ async def get_booking_by_id(booking_id: int) -> Optional[Dict[str, Any]]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            SELECT id, client_id, date, time, duration_minutes, service_code, service_text, price_text,
+            SELECT id, client_id, date, time, duration_minutes, occupy_minutes, service_code, service_text, price_text,
                    client_name, phone, status
             FROM bookings
             WHERE id = ?
@@ -789,12 +813,13 @@ async def get_booking_by_id(booking_id: int) -> Optional[Dict[str, Any]]:
         "date": row[2],
         "time": row[3],
         "duration_minutes": int(row[4]),
-        "service_code": row[5],
-        "service_text": row[6],
-        "price_text": row[7],
-        "client_name": row[8],
-        "phone": row[9],
-        "status": row[10],
+        "occupy_minutes": (int(row[5]) if row[5] is not None else None),
+        "service_code": row[6],
+        "service_text": row[7],
+        "price_text": row[8],
+        "client_name": row[9],
+        "phone": row[10],
+        "status": row[11],
     }
 
 
@@ -816,7 +841,7 @@ async def get_pending_bookings() -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            SELECT id, date, time, duration_minutes, client_name, phone, service_text, price_text
+            SELECT id, date, time, duration_minutes, occupy_minutes, client_name, phone, service_text, price_text
             FROM bookings
             WHERE status = 'pending'
             ORDER BY date, time
@@ -830,10 +855,11 @@ async def get_pending_bookings() -> List[Dict[str, Any]]:
             "date": r[1],
             "time": r[2],
             "duration_minutes": int(r[3]),
-            "client_name": r[4],
-            "phone": r[5],
-            "service_text": r[6],
-            "price_text": r[7],
+            "occupy_minutes": (int(r[4]) if r[4] is not None else None),
+            "client_name": r[5],
+            "phone": r[6],
+            "service_text": r[7],
+            "price_text": r[8],
         }
         for r in rows
     ]
@@ -843,7 +869,7 @@ async def get_client_bookings(client_id: int, limit: int = 10) -> List[Dict[str,
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            SELECT id, date, time, duration_minutes, service_text, price_text, status
+            SELECT id, date, time, duration_minutes, occupy_minutes, service_text, price_text, status
             FROM bookings
             WHERE client_id = ?
             ORDER BY date DESC, time DESC
@@ -859,9 +885,10 @@ async def get_client_bookings(client_id: int, limit: int = 10) -> List[Dict[str,
             "date": r[1],
             "time": r[2],
             "duration_minutes": int(r[3]),
-            "service_text": r[4],
-            "price_text": r[5],
-            "status": r[6],
+            "occupy_minutes": (int(r[4]) if r[4] is not None else None),
+            "service_text": r[5],
+            "price_text": r[6],
+            "status": r[7],
         }
         for r in rows
     ]
@@ -962,10 +989,7 @@ async def get_due_reminders(now_iso: str, limit: int = 50) -> List[Dict[str, Any
 
 async def mark_reminder_sent(reminder_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE reminders SET status = 'sent' WHERE id = ?",
-            (int(reminder_id),),
-        )
+        await db.execute("UPDATE reminders SET status = 'sent' WHERE id = ?", (int(reminder_id),))
         await db.commit()
 
 
@@ -1136,16 +1160,21 @@ async def get_booking_with_client_admin(booking_id: int):
     client_name = row[8] if row[8] is not None else ""
 
     return (
-        int(row[0]), row[1], row[2], row[3],
-        row[4], row[5], int(row[6]),
-        client_tg_id, client_name
+        int(row[0]),
+        row[1],
+        row[2],
+        row[3],
+        row[4],
+        row[5],
+        int(row[6]),
+        client_tg_id,
+        client_name,
     )
 
 
 async def get_booked_times_for_date_admin(date_str: str) -> List[str]:
     """
     Старти часу, які вже зайняті активними записами (pending/approved) + completed.
-    (Адміну корисніше бачити все зайняте, а не тільки approved/completed.)
     """
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
